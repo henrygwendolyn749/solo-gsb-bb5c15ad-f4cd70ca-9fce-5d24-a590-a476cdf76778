@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
+from .print_audit import PrintAuditError, audit_print_pages
 from .rehearsal import (
     Location,
     RehearsalError,
@@ -452,6 +453,64 @@ def _slot_to_out(slot: TurnSlot) -> TurnSlotOut:
     )
 
 
+# ---------------------------------------- 纸质备用谱页序核对
+
+
+class PrintAuditRequest(BaseModel):
+    """纸质谱页序核对请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scanned_pages: List[int] = Field(
+        ...,
+        description="按实物顺序抄录的每页页码（正整数，允许为空、允许重复，"
+        "也允许出现超过规划页数的错页页码），长度上限 500",
+    )
+
+    @field_validator("scanned_pages", mode="before")
+    @classmethod
+    def _reject_non_integer_pages(cls, value: object) -> object:
+        """页码必须是严格正整数：拒绝 1.5 之类浮点（pydantic 默认会强转）与布尔。"""
+        if isinstance(value, list):
+            for page in value:
+                if not isinstance(page, int) or isinstance(page, bool):
+                    raise ValueError(f"抄录页码必须为正整数（收到 {page!r}）")
+        return value
+
+
+class AuditStepOut(BaseModel):
+    """一步修正动作。"""
+
+    action: str = Field(
+        ...,
+        description="动作：keep 保留、replace 替换错页、remove 移除多页、"
+        "insert 补入缺页",
+    )
+    position: int = Field(
+        ...,
+        description="原输入 scanned_pages 中的 0 基位置；保留/替换/移除为被处理"
+        "实物页下标，补入表示插在该位置之前，等于数组长度即末尾",
+    )
+    observed_page: Optional[int] = Field(
+        ..., description="该位置抄录到的页码；补入无实物页，为 null"
+    )
+    target_page: Optional[int] = Field(
+        ..., description="该位置应有的页码；移除不产生目标页，为 null"
+    )
+
+
+class PrintAuditResponse(BaseModel):
+    id: str
+    request: PrintAuditRequest
+    page_count: int = Field(..., description="规划页数（正确序列 1..page_count）")
+    operation_count: int = Field(
+        ..., description="最少操作数（替换/移除/补入步数，不含保留）"
+    )
+    steps: List[AuditStepOut] = Field(
+        ..., description="从前到后的确定性修正步骤序列（含保留步）"
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -644,6 +703,48 @@ def plan_rehearsal_turn_slots(
         request=payload,
         total_duration=rehearsal.total_duration,
         slots=[_slot_to_out(slot) for slot in slots],
+    )
+
+
+@app.post("/api/v1/plans/{plan_id}/print-audit", response_model=PrintAuditResponse)
+def audit_plan_print_pages(
+    plan_id: str, payload: PrintAuditRequest
+) -> PrintAuditResponse:
+    """为已保存规划核对纸质备用谱的实物页序。
+
+    以规划的 1..page_count 为正确顺序，把按实物顺序抄录的 scanned_pages
+    （可为空、可含重复页）按补入缺页、移除多页、替换错页修正，求最少操作数
+    与一条确定的修正步骤序列；同成本方案依次优先保留、替换、移除、补入。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_result = PlanResult(**record["result"])
+    try:
+        result = audit_print_pages(
+            page_count=plan_result.page_count,
+            scanned_pages=payload.scanned_pages,
+        )
+    except PrintAuditError as exc:
+        # 页码非正整数 / 含布尔值 / 规划或实物页数超限：语义错误，明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return PrintAuditResponse(
+        id=record["id"],
+        request=payload,
+        page_count=result.page_count,
+        operation_count=result.operation_count,
+        steps=[
+            AuditStepOut(
+                action=step.action,
+                position=step.position,
+                observed_page=step.observed_page,
+                target_page=step.target_page,
+            )
+            for step in result.steps
+        ],
     )
 
 
