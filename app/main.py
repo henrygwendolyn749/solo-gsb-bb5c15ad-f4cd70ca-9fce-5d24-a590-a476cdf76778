@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
+from .print_audit import AuditStep, PrintAuditError, audit_print_pages
 from .rehearsal import (
     Location,
     RehearsalError,
@@ -452,6 +453,85 @@ def _slot_to_out(slot: TurnSlot) -> TurnSlotOut:
     )
 
 
+# ---------------------------------------- 纸质备用谱页序核对
+
+
+class PrintAuditRequest(BaseModel):
+    """纸质备用谱页序核对请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scanned_pages: List[int] = Field(
+        ...,
+        description="按纸质备用谱实物顺序抄录的页码，可为空数组、允许重复页；"
+        "元素必须是正整数（拒绝小数与布尔值），长度不超过 500",
+    )
+
+    @field_validator("scanned_pages", mode="before")
+    @classmethod
+    def _reject_non_positive_integer_pages(cls, value: object) -> object:
+        """页码必须是严格正整数：拒绝 1.0 之类浮点（pydantic 默认会强转）与布尔。"""
+        if isinstance(value, list):
+            for p in value:
+                if not isinstance(p, int) or isinstance(p, bool) or p < 1:
+                    raise ValueError(
+                        f"scanned_pages 中每个页码必须为正整数（收到 {p!r}），"
+                        "不接受小数、布尔值、零或负数"
+                    )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_length(self) -> "PrintAuditRequest":
+        if len(self.scanned_pages) > 500:
+            raise ValueError(
+                f"实物页数（{len(self.scanned_pages)}）超过上限 500"
+            )
+        return self
+
+
+class PrintAuditStepOut(BaseModel):
+    """一步核对结果：保留或一次修正操作。"""
+
+    operation: str = Field(
+        ...,
+        description="操作类型：keep 保留 / replace 替换错页 / "
+        "remove 移除多页 / insert 补入缺页",
+    )
+    position: int = Field(
+        ...,
+        description="原输入 scanned_pages 中的 0 基位置；补入表示插在该位置之前，"
+        "等于数组长度时表示末尾",
+    )
+    observed_page: Optional[int] = Field(
+        ..., description="该位置观察到的实物页码；补入缺页时为 null"
+    )
+    target_page: Optional[int] = Field(
+        ..., description="应对齐的目标页码（1..page_count）；移除多页时为 null"
+    )
+
+
+class PrintAuditResponse(BaseModel):
+    id: str
+    request: PrintAuditRequest
+    page_count: int = Field(..., description="已保存规划的总页数（正确页序 1..page_count）")
+    operation_count: int = Field(
+        ...,
+        description="最少修正操作数（补入缺页、移除多页、替换错页各计一次，不含保留）",
+    )
+    steps: List[PrintAuditStepOut] = Field(
+        ..., description="一条确定的完整步骤序列（含保留步），按对齐顺序给出"
+    )
+
+
+def _audit_step_to_out(step: AuditStep) -> PrintAuditStepOut:
+    return PrintAuditStepOut(
+        operation=step.operation,
+        position=step.position,
+        observed_page=step.observed_page,
+        target_page=step.target_page,
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -496,6 +576,43 @@ def get_plan(plan_id: str) -> PlanResponse:
         created_at=record["created_at"],
         request=PlanRequest(**record["request"]),
         result=PlanResult(**record["result"]),
+    )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/print-audit",
+    response_model=PrintAuditResponse,
+)
+def audit_plan_print_pages(
+    plan_id: str, payload: PrintAuditRequest
+) -> PrintAuditResponse:
+    """核对纸质备用谱实物页序与已保存规划页序 1..page_count 的差异。
+
+    以规划的正确页序为目标，把按实物顺序抄录的页码（可为空、含重复页）与
+    目标对齐，给出最少操作数（补入缺页、移除多页、替换错页各计一次）与一条
+    确定的修正步骤序列；同成本时按保留、替换、移除、补入的顺序选取。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_result = PlanResult(**record["result"])
+    try:
+        audit = audit_print_pages(
+            page_count=plan_result.page_count,
+            scanned_pages=payload.scanned_pages,
+        )
+    except PrintAuditError as exc:
+        # 规划页数超限 / 实物页码非正整数等语义错误：明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return PrintAuditResponse(
+        id=record["id"],
+        request=payload,
+        page_count=audit.page_count,
+        operation_count=audit.operation_count,
+        steps=[_audit_step_to_out(step) for step in audit.steps],
     )
 
 
